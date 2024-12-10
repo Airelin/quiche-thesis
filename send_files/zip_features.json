@@ -1,0 +1,6 @@
+{
+    "Content-type": "zip",
+    "Device-type": "AIS",
+    "Incremental": "false",
+    "Starvation-rate": "0.3"
+}

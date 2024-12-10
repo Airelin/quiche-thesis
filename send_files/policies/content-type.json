@@ -1,0 +1,10 @@
+{
+    "text": 1,
+    "audio": 2,
+    "image": 3,
+    "video": 4,
+    "zip": 5,
+    "error": 0,
+    "warning": 1,
+    "default": 3
+}

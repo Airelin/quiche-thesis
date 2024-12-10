@@ -1,0 +1,6 @@
+{
+    "Content-type": "image",
+    "Device-type": "Weather-Sensor",
+    "Incremental": "false",
+    "Starvation-rate": "0.1"
+}

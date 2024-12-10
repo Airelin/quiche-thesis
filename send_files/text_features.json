@@ -1,0 +1,6 @@
+{
+    "Content-type": "text",
+    "Device-type": "GPS-Sensor",
+    "Incremental": "true",
+    "Starvation-rate": "0.5"
+}

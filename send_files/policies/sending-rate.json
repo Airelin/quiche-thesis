@@ -1,0 +1,8 @@
+{
+    "tbit": 5,
+    "gbit": 4,
+    "mbit": 3,
+    "kbit": 2,
+    "bit": 1,
+    "default": 3
+}

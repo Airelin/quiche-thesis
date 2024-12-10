@@ -1,0 +1,12 @@
+{
+    "Camera": 4,
+	"Telephone": 5,
+	"Microphone": 5,
+	"Weather-Sensor": 7,
+	"Acceleration-Sensor": 1,
+	"GPS-Sensor": 1,
+	"Radar-Sensor": 3,
+	"LiDar-Sensor": 3,
+    "AIS": 7,
+    "default": 3
+}

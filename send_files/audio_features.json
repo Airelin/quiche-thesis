@@ -1,0 +1,6 @@
+{
+    "Content-type": "audio",
+    "Device-type": "Microphone",
+    "Incremental": "true",
+    "Starvation-rate": "0.3"
+}
