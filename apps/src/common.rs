@@ -29,6 +29,7 @@
 //! This module provides some utility functions that are common to quiche
 //! applications.
 
+use std::fs::OpenOptions;
 use std::io::prelude::*;
 
 use std::collections::HashMap;
@@ -38,11 +39,13 @@ use std::convert::TryFrom;
 
 use std::fmt::Write as _;
 
+use std::io::BufWriter;
 use std::rc::Rc;
 
 use std::cell::RefCell;
 
 use std::path;
+use std::time::SystemTime;
 
 use ring::rand::SecureRandom;
 
@@ -50,6 +53,7 @@ use quiche::ConnectionId;
 
 use quiche::h3::NameValue;
 use quiche::h3::Priority;
+use std::convert::TryInto;
 
 pub fn stdout_sink(out: String) {
     print!("{out}");
@@ -121,6 +125,31 @@ fn make_resource_writer(
         if cardinal > 1 {
             path = format!("{path}.{cardinal}");
         }
+
+        match std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+            Ok(f) => return Some(std::io::BufWriter::new(f)),
+
+            Err(e) => panic!(
+                "Error creating file for {}, attempted path was {}: {}",
+                url, path, e
+            ),
+        }
+    }
+
+    None
+}
+
+/// Create a BufWriter
+pub fn make_resource_writer_post(
+    url: &url::Url, target_path: &Option<String>,
+) -> Option<std::io::BufWriter<std::fs::File>> {
+    if let Some(tp) = target_path {
+        let resource =
+            url.path_segments().map(|c| c.collect::<Vec<_>>()).unwrap();
+
+        let mut path = format!("{}/{}", tp, resource.iter().last().unwrap());
+
+        path = format!("{path}");
 
         match std::fs::File::create(&path) {
             Ok(f) => return Some(std::io::BufWriter::new(f)),
@@ -338,6 +367,7 @@ pub trait HttpConn {
         &mut self, conn: &mut quiche::Connection, target_path: &Option<String>,
     );
 
+    // actually it is handle responses here
     fn handle_responses(
         &mut self, conn: &mut quiche::Connection, buf: &mut [u8],
         req_start: &std::time::Instant,
@@ -356,6 +386,8 @@ pub trait HttpConn {
         &mut self, conn: &mut quiche::Connection,
         partial_responses: &mut HashMap<u64, PartialResponse>, stream_id: u64,
     );
+
+    fn get_h3_conn(&mut self) -> Option<&mut quiche::h3::Connection>;
 }
 
 /// Represents an HTTP/0.9 formatted request.
@@ -437,6 +469,10 @@ impl Http09Conn {
 }
 
 impl HttpConn for Http09Conn {
+    fn get_h3_conn(&mut self) -> Option<&mut quiche::h3::Connection>{
+        None
+    }
+
     fn send_requests(
         &mut self, conn: &mut quiche::Connection, target_path: &Option<String>,
     ) {
@@ -787,7 +823,6 @@ impl Http3Conn {
                         b":path",
                         url[url::Position::BeforePath..].as_bytes(),
                     ),
-                    quiche::h3::Header::new(b"user-agent", b"quiche"),
                 ];
 
                 let priority = if send_priority_update {
@@ -898,6 +933,7 @@ impl Http3Conn {
         let mut path = None;
         let mut method = None;
         let mut priority = vec![];
+        let mut conn_id = None;
 
         // Parse some of the request headers.
         for hdr in request {
@@ -956,6 +992,8 @@ impl Http3Conn {
                 b"priority" => priority = hdr.value().to_vec(),
 
                 b"host" => host = Some(std::str::from_utf8(hdr.value()).unwrap()),
+
+                b"conn-id" => conn_id = Some(std::str::from_utf8(hdr.value()).unwrap()),
 
                 _ => (),
             }
@@ -1070,6 +1108,7 @@ impl Http3Conn {
         let url = format!("{decided_scheme}://{decided_host}{decided_path}");
         let url = url::Url::parse(&url).unwrap();
 
+        // index is the file used if / is last character (index.html is default value)
         let pathbuf = path::PathBuf::from(url.path());
         let pathbuf = autoindex(pathbuf, index);
 
@@ -1095,11 +1134,16 @@ impl Http3Conn {
                     Err(_) => (404, b"Not Found!".to_vec()),
                 }
             },
+            // Implement POST
+            "POST" => {
+                // Response has no body in this case
+                (200, Vec::new())
+            },
 
             _ => (405, Vec::new()),
         };
 
-        let headers = vec![
+        let mut headers = vec![
             quiche::h3::Header::new(b":status", status.to_string().as_bytes()),
             quiche::h3::Header::new(b"server", b"quiche"),
             quiche::h3::Header::new(
@@ -1107,12 +1151,19 @@ impl Http3Conn {
                 body.len().to_string().as_bytes(),
             ),
         ];
+        match conn_id {
+            Some(cid) => headers.push(quiche::h3::Header::new(b"conn-id", cid.as_bytes())),
+            None => (),
+        }
 
         Ok((headers, body, priority))
     }
 }
 
 impl HttpConn for Http3Conn {
+    fn get_h3_conn(&mut self) -> Option<&mut quiche::h3::Connection>{
+        Some(&mut self.h3_conn)
+    }
     fn send_requests(
         &mut self, conn: &mut quiche::Connection, target_path: &Option<String>,
     ) {
@@ -1155,8 +1206,36 @@ impl HttpConn for Http3Conn {
             }
 
             req.stream_id = Some(s);
-            req.response_writer =
-                make_resource_writer(&req.url, target_path, req.cardinal);
+            // We use stream 0 as control stream
+            if s != 0{
+                req.response_writer =
+                    make_resource_writer(&req.url, target_path, req.cardinal);
+            } else {
+                match &target_path {
+                    Some(path) => {
+                        let file = OpenOptions::new().create(true).append(true).open(&path);
+                        let mut log_writer =match file{
+                                    Ok(v) => Some(BufWriter::new(v)),
+                                    Err(_) => None,
+                                };
+                        // Log incoming response
+                        match log_writer {
+                            Some(ref mut w) => {
+                                let system_time = SystemTime::now();
+                                let datetime = system_time.duration_since(SystemTime::UNIX_EPOCH);
+                                let text = match datetime {
+                                    Ok(t) => format!("{};header;{};0\n", t.as_nanos(),conn.trace_id().to_string()),
+                                    Err(_) => format!("NaN;header;{};0\n",conn.trace_id().to_string()),
+                                };
+                                w.write_all(text.as_bytes()).ok();
+                                w.flush().unwrap();
+                            },
+                            None => (),
+                        }
+                    },
+                    None => (),
+                }
+            }
             self.sent_body_bytes.insert(s, 0);
 
             reqs_done += 1;
@@ -1172,6 +1251,7 @@ impl HttpConn for Http3Conn {
 
                 // Always try to send all remaining bytes, so always set fin to
                 // true.
+                debug!("Send body, {:?}", conn.trace_id());
                 let sent = match self.h3_conn.send_body(
                     conn,
                     *stream_id,
@@ -1187,13 +1267,70 @@ impl HttpConn for Http3Conn {
                         continue;
                     },
                 };
+                match &target_path {
+                    Some(path) => {
+                        let file = OpenOptions::new().create(true).append(true).open(&path);
+                        let mut log_writer =match file{
+                                    Ok(v) => Some(BufWriter::new(v)),
+                                    Err(_) => None,
+                                };
+                        // Log incoming response
+                        match log_writer {
+                            Some(ref mut w) => {
+                                let now_transmitted = *sent_bytes + sent;
+                                let system_time = SystemTime::now();
+                                let datetime = system_time.duration_since(SystemTime::UNIX_EPOCH);
+                                let text = match datetime {
+                                    Ok(t) => format!("{};body;{};{}\n", t.as_nanos(),conn.trace_id().to_string(), now_transmitted),
+                                    Err(_) => format!("NaN;body;{};{}\n",conn.trace_id().to_string(), now_transmitted),
+                                };
+                                w.write_all(text.as_bytes()).ok();
+                                w.flush().unwrap();
+                            },
+                            None => (),
+                        }
+                    },
+                    None => (),
+                }
+                // Needed if we want to send intermediate header files (and are fine if we change the stream number by doing so)
+                // if *sent_bytes > 20000 && *sent_bytes < 60000 {
+                //     let mut funny_header = Vec::new();
+                //     funny_header.push(quiche::h3::Header::new(b"feature-header", b"true"));
+                //     info!("Send header: {:?}", funny_header);
+                //     match self.h3_conn.send_request(
+                //         conn,
+                //         &funny_header,
+                //         self.body.is_none(),
+                //     ) {
+                //         Ok(_) => (),
+        
+                //         Err(quiche::h3::Error::TransportError(
+                //             quiche::Error::StreamLimit,
+                //         )) => {
+                //             debug!("not enough stream credits, retry later...");
+                //             break;
+                //         },
+        
+                //         Err(quiche::h3::Error::StreamBlocked) => {
+                //             debug!("stream is blocked, retry later...");
+                //             break;
+                //         },
+        
+                //         Err(e) => {
+                //             error!("failed to send request {:?}", e);
+                //             break;
+                //         },
+                //     }
+                // }
 
+                debug!("sent = {sent}, body length = {}, scid = {:?}", body.len(), conn.trace_id());
                 *sent_bytes += sent;
             }
         }
 
         // And finally any DATAGRAMS.
         if let Some(ds) = self.dgram_sender.as_mut() {
+            debug!("Sending Dgrams, {:?}", conn.trace_id());
             let mut dgrams_done = 0;
 
             for _ in ds.dgrams_sent..ds.dgram_count {
@@ -1214,6 +1351,7 @@ impl HttpConn for Http3Conn {
         }
     }
 
+    // Maybe hand over with some file or channel?
     fn handle_responses(
         &mut self, conn: &mut quiche::Connection, buf: &mut [u8],
         req_start: &std::time::Instant,
@@ -1227,6 +1365,31 @@ impl HttpConn for Http3Conn {
                         stream_id
                     );
 
+                    // Only track new files on the consumer client
+                    if stream_id != 0 {
+                        // Make BufWriter
+                        let path = format!("./logs/client.txt");
+                        let file = OpenOptions::new().create(true).append(true).open(&path);
+                        let mut log_writer =match file{
+                                    Ok(v) => Some(BufWriter::new(v)),
+                                    Err(_) => None,
+                                };
+                        // Log incoming response
+                        match log_writer {
+                            Some(ref mut w) => {
+                                let system_time = SystemTime::now();
+                                let datetime = system_time.duration_since(SystemTime::UNIX_EPOCH);
+                                let text = match datetime {
+                                    Ok(t) => format!("{};header;{};0\n", t.as_nanos(),stream_id),
+                                    Err(_) => format!("NaN;header;{};0\n",stream_id),
+                                };
+                                w.write_all(text.as_bytes()).ok();
+                                w.flush().unwrap();
+                            },
+                            None => (),
+                        }
+                    }
+
                     let req = self
                         .reqs
                         .iter_mut()
@@ -1234,6 +1397,64 @@ impl HttpConn for Http3Conn {
                         .unwrap();
 
                     req.response_hdrs = list;
+
+                    if stream_id == 0 {
+                        let mut conn_id = None;
+                        let mut file_name = None;
+                        for hdr in &req.response_hdrs{
+                            match hdr.name(){
+                                b"conn-id" => conn_id = Some(std::str::from_utf8(hdr.value()).unwrap()),
+                                b":path" => file_name = Some(std::str::from_utf8(hdr.value()).unwrap()),
+                                _ => (),
+                            }
+                        }
+                        let file_name = match file_name {
+                            Some(name) => {
+                                let v: Vec<&str> = name.split("/").collect();
+                                ["",v[v.len()-1]].join("/")
+                            },
+                            None => "/SomeData.txt".to_string(),
+                        };
+
+                        match conn_id{
+                            Some(cid) => {
+                                // Should be "the usual" headers + conn-id
+                                let mut headers = vec![quiche::h3::Header::new(b":method", b"GET"),
+                                quiche::h3::Header::new(b":scheme", b"https"),
+                                quiche::h3::Header::new(b":authority", b"127.0.0.1:1234"),
+                                quiche::h3::Header::new(
+                                    b":path",
+                                    file_name.as_bytes())];
+                                headers.push(quiche::h3::Header::new(b"conn-id",cid.as_bytes()));
+                                info!("Headers {:?}", headers);
+
+                                debug!("Building new stream!");
+                                match self.h3_conn.send_request(conn, &headers, true){
+                                    Ok(v) => {
+                                        debug!("Built stream {}",v);
+                                        let target_path = Some("./received_files".to_string());
+                                        let url_string = format!("https://127.0.0.1:1234{}",file_name);
+                                        let url = url::Url::parse(&url_string).unwrap();
+                                        let request = Http3Request {
+                                            url: url.clone(),
+                                            cardinal: 0,
+                                            hdrs: headers,
+                                            priority: None,
+                                            response_hdrs: Vec::new(),
+                                            response_body: Vec::new(),
+                                            response_body_max: req.response_body_max.clone(),
+                                            stream_id: Some(v),
+                                            response_writer: make_resource_writer(&url, &target_path, 1),
+                                        };
+                                        self.reqs.push(request);
+                                        },
+                                    Err(_) => (),
+                                }
+                            },
+                            None => warn!("StreamID is 0 but Connection Id is None!"),
+                        }
+                    }
+
                 },
 
                 Ok((stream_id, quiche::h3::Event::Data)) => {
@@ -1244,32 +1465,72 @@ impl HttpConn for Http3Conn {
                             "got {} bytes of response data on stream {}",
                             read, stream_id
                         );
-
+                        
                         let req = self
-                            .reqs
-                            .iter_mut()
-                            .find(|r| r.stream_id == Some(stream_id))
-                            .unwrap();
+                                .reqs
+                                .iter_mut()
+                                .find(|r| r.stream_id == Some(stream_id))
+                                .unwrap();
 
-                        let len = std::cmp::min(
-                            read,
-                            req.response_body_max - req.response_body.len(),
-                        );
-                        req.response_body.extend_from_slice(&buf[..len]);
+                        let readu: u64 = read.try_into().unwrap();
+                        req.cardinal = req.cardinal + readu;
 
-                        match &mut req.response_writer {
-                            Some(rw) => {
-                                rw.write_all(&buf[..read]).ok();
-                            },
-
-                            None =>
-                                if !self.dump_json {
-                                    self.output_sink.borrow_mut()(unsafe {
-                                        String::from_utf8_unchecked(
-                                            buf[..read].to_vec(),
-                                        )
-                                    });
+                        // Make BufWriter if it is a new file
+                        if stream_id != 0 {
+                            let path = format!("./logs/client.txt");
+                            let file = OpenOptions::new().create(true).append(true).open(&path);
+                            let mut log_writer =match file{
+                                Ok(v) => Some(BufWriter::new(v)),
+                                Err(_) => None,
+                            };
+                            // Log incoming response
+                            match log_writer {
+                                Some(ref mut w) => {
+                                    let system_time = SystemTime::now();
+                                    let datetime = system_time.duration_since(SystemTime::UNIX_EPOCH);
+                                    let text = match datetime {
+                                        Ok(t) => format!("{};body;{};{}\n", t.as_nanos(),stream_id, req.cardinal),
+                                        Err(_) => format!("NaN;body;{};{}\n",stream_id, req.cardinal),
+                                    };
+                                    w.write_all(text.as_bytes()).ok();
+                                    w.flush().unwrap();
                                 },
+                                None => (),
+                            }
+                        }
+                        // Only use if data was not send on control stream
+                        if stream_id != 0 {
+                            
+                            trace!("Request url: {:?}", req.url);
+
+                            let len = std::cmp::min(
+                                read,
+                                req.response_body_max - req.response_body.len(),
+                            );
+                            req.response_body.extend_from_slice(&buf[..len]);
+
+                            match &mut req.response_writer {
+                                Some(rw) => {
+                                    trace!("Writing to file: {:?}",rw);
+                                    rw.write_all(&buf[..read]).ok();
+                                },
+
+                                None =>
+                                    if !self.dump_json {
+                                        self.output_sink.borrow_mut()(unsafe {
+                                            String::from_utf8_unchecked(
+                                                buf[..read].to_vec(),
+                                            )
+                                        });
+                                    },
+                            }
+                        if conn.stream_finished(stream_id){
+                            info!("Total response body length: {}", req.cardinal);
+                        }
+                        // In case we accidentially got data on stream 0
+                        } else {
+                            error!("Don't expect data on control stream!");
+                            break;
                         }
                     }
                 },
@@ -1278,7 +1539,7 @@ impl HttpConn for Http3Conn {
                     self.reqs_complete += 1;
                     let reqs_count = self.reqs.len();
 
-                    debug!(
+                    info!(
                         "{}/{} responses received",
                         self.reqs_complete, reqs_count
                     );
@@ -1388,33 +1649,39 @@ impl HttpConn for Http3Conn {
 
     fn handle_requests(
         &mut self, conn: &mut quiche::Connection,
-        _partial_requests: &mut HashMap<u64, PartialRequest>,
+        partial_requests: &mut HashMap<u64, PartialRequest>,
         partial_responses: &mut HashMap<u64, PartialResponse>, root: &str,
         index: &str, buf: &mut [u8],
     ) -> quiche::h3::Result<()> {
+        // Store data needed for processing
+        let mut body: Vec<u8> = Vec::new();
+        let mut priority: Vec<u8> = Vec::new(); 
+
         // Process HTTP stream-related events.
         loop {
             match self.h3_conn.poll(conn) {
-                Ok((stream_id, quiche::h3::Event::Headers { list, .. })) => {
+                Ok((stream_id, quiche::h3::Event::Headers { list, has_body })) => {
+                    let body_str = { if has_body {
+                        "a"
+                    }
+                    else {
+                        "no"
+                    }};
                     info!(
-                        "{} got request {:?} on stream id {}",
+                        "{} got request {:?} with {} body on stream id {}",
                         conn.trace_id(),
                         hdrs_to_strings(&list),
+                        body_str,
                         stream_id
                     );
 
                     self.largest_processed_request =
                         std::cmp::max(self.largest_processed_request, stream_id);
 
-                    // We decide the response based on headers alone, so
-                    // stop reading the request stream so that any body
-                    // is ignored and pointless Data events are not
-                    // generated.
-                    conn.stream_shutdown(stream_id, quiche::Shutdown::Read, 0)
-                        .unwrap();
+                    let request = &list;
 
-                    let (mut headers, body, mut priority) =
-                        match Http3Conn::build_h3_response(root, index, &list) {
+                    (_, body, priority) =
+                        match Http3Conn::build_h3_response(root, index, request) {
                             Ok(v) => v,
 
                             Err((error_code, _)) => {
@@ -1427,93 +1694,184 @@ impl HttpConn for Http3Conn {
                                 continue;
                             },
                         };
-
-                    match self.h3_conn.take_last_priority_update(stream_id) {
-                        Ok(v) => {
-                            priority = v;
-                        },
-
-                        Err(quiche::h3::Error::Done) => (),
-
-                        Err(e) => error!(
-                            "{} error taking PRIORITY_UPDATE {}",
-                            conn.trace_id(),
-                            e
-                        ),
-                    }
-
-                    if !priority.is_empty() {
-                        headers.push(quiche::h3::Header::new(
-                            b"priority",
-                            priority.as_slice(),
-                        ));
-                    }
-
-                    #[cfg(feature = "sfv")]
-                    let priority =
-                        match quiche::h3::Priority::try_from(priority.as_slice())
-                        {
-                            Ok(v) => v,
-                            Err(_) => quiche::h3::Priority::default(),
+                    
+                    // If we are not on the control stream
+                    if stream_id != 0{
+                        let mut conn_id = None;
+                        for hdr in request{
+                            match hdr.name(){
+                                b"conn-id" => {
+                                    conn_id = Some(std::str::from_utf8(hdr.value()).unwrap());
+                                },
+                                _ => (),
+                            }
+                        }
+                        // If given a connection id return it via partial responses to be used for mapping stream_ids and responses
+                        match conn_id {
+                            Some(_) => {
+                                let cid_wrapper = PartialResponse{
+                                    headers : Some(list),
+                                    priority: None,
+                                    body : Vec::new(),
+                                    written: 0,
+                                };
+                                partial_responses.insert(stream_id,cid_wrapper);
+                            },
+                            None => (),
                         };
 
-                    #[cfg(not(feature = "sfv"))]
-                    let priority = quiche::h3::Priority::default();
-
-                    info!(
-                        "{} prioritizing response on stream {} as {:?}",
-                        conn.trace_id(),
-                        stream_id,
-                        priority
-                    );
-
-                    match self.h3_conn.send_response_with_priority(
-                        conn, stream_id, &headers, &priority, false,
-                    ) {
-                        Ok(v) => v,
-
-                        Err(quiche::h3::Error::StreamBlocked) => {
-                            let response = PartialResponse {
-                                headers: Some(headers),
-                                priority: Some(priority),
-                                body,
-                                written: 0,
-                            };
-
-                            partial_responses.insert(stream_id, response);
-                            continue;
-                        },
-
-                        Err(e) => {
-                            error!(
-                                "{} stream send failed {:?}",
-                                conn.trace_id(),
-                                e
-                            );
-
-                            break;
-                        },
                     }
-
-                    let response = PartialResponse {
-                        headers: None,
-                        priority: None,
-                        body,
-                        written: 0,
+                    // Push some request to see that there is a request on this stream
+                    let r = PartialRequest{
+                        req: Vec::new(),
                     };
-
-                    partial_responses.insert(stream_id, response);
+                    partial_requests.insert(stream_id,r);
+                // }
                 },
 
                 Ok((stream_id, quiche::h3::Event::Data)) => {
-                    info!(
+                    trace!(
                         "{} got data on stream id {}",
                         conn.trace_id(),
                         stream_id
                     );
+                    let mut headers = Vec::new();
+                    // handle the request body
+                    while let Ok(read) =
+                        self.h3_conn.recv_body(conn, stream_id, buf)
+                    {
+                        debug!(
+                            "got {} bytes of body data on stream {}",
+                            read, stream_id
+                        );
+                        let req = self
+                            .reqs
+                            .iter_mut()
+                            .find(|r| r.stream_id == Some(stream_id))
+                            .unwrap();
+                        // These are the headers of the response as calculated previously
+                        headers = req.response_hdrs.clone();
+                        
+                        // req.response_writer writes the request body
+                        // TODO: Store &buf[..read] as partial body to some response_body
+                        match &mut req.response_writer {
+                            Some(rw) => {
+                                rw.write_all(&buf[..read]).ok();
+                            },
+
+                            None =>
+                                if !self.dump_json {
+                                    self.output_sink.borrow_mut()(unsafe {
+                                        String::from_utf8_unchecked(
+                                            buf[..read].to_vec(),
+                                        )
+                                    });
+                                },
+                        }
+                    }
+                    // If fin bit was set (or connection was reset) try sending response
+                    if conn.stream_finished(stream_id){
+                        let req = self
+                            .reqs
+                            .iter_mut()
+                            .find(|r| r.stream_id == Some(stream_id))
+                            .unwrap();
+                        // TODO: Uncatched result!!!!
+                        let _r = match &mut req.response_writer{
+                            Some(rw) => rw.flush(),
+                            None => Ok(()),
+                        };
+
+
+                        match self.h3_conn.take_last_priority_update(stream_id) {
+                            Ok(v) => {
+                                priority = v;
+                            },
+    
+                            Err(quiche::h3::Error::Done) => (),
+    
+                            Err(e) => error!(
+                                "{} error taking PRIORITY_UPDATE {}",
+                                conn.trace_id(),
+                                e
+                            ),
+                        }
+
+                        if !priority.is_empty() {
+                            headers.push(quiche::h3::Header::new(
+                                b"priority",
+                                priority.as_slice(),
+                            ));
+                        }
+    
+                        #[cfg(feature = "sfv")]
+                        let priority =
+                            // The "try_from()" sets initial priority to default if not set yet
+                            // Also it sets urgency to 7 if its not between 0..7 (so also -1 would be 7 not 0)
+                            // Returns Error Done if u or i is not an int
+                            match quiche::h3::Priority::try_from(priority.as_slice())
+                            {
+                                Ok(v) => v,
+                                Err(_) => quiche::h3::Priority::default(),
+                            };
+    
+                        #[cfg(not(feature = "sfv"))]
+                        let priority = quiche::h3::Priority::default();
+    
+                        trace!(
+                            "{} prioritizing response on stream {} as {:?}",
+                            conn.trace_id(),
+                            stream_id,
+                            priority
+                        );
+    
+                        // Set priority of quiche stream and send headers
+                        let body_cloned = body.clone();
+
+                        // TODO: Write function "get priority from policy"
+                        match self.h3_conn.send_response_with_priority(
+                            conn, stream_id, &headers, &priority, false,
+                        ) {
+                            Ok(v) => v,
+    
+                            Err(quiche::h3::Error::StreamBlocked) => {
+                                let response = PartialResponse {
+                                    headers: Some(headers),
+                                    priority: Some(priority),
+                                    body: body_cloned,
+                                    written: 0,
+                                };
+    
+                                partial_responses.insert(stream_id, response);
+                                continue;
+                            },
+    
+                            Err(e) => {
+                                debug!("headers: {:?}",headers);
+                                error!(
+                                    "{} stream send failed while sending response from Data {:?}",
+                                    conn.trace_id(),
+                                    e
+                                );
+    
+                                break;
+                            },
+                        }
+                        
+    
+                        // Headers and priority are already sent at this point
+                        let response = PartialResponse {
+                            headers: None,
+                            priority: None,
+                            body: body_cloned,
+                            written: 0,
+                        };
+    
+                        partial_responses.insert(stream_id, response);
+                    }
                 },
 
-                Ok((_stream_id, quiche::h3::Event::Finished)) => (),
+                Ok((_, quiche::h3::Event::Finished)) => (),
 
                 Ok((_stream_id, quiche::h3::Event::Reset { .. })) => (),
 
@@ -1609,15 +1967,13 @@ impl HttpConn for Http3Conn {
                 },
 
                 Err(e) => {
-                    error!("{} stream send failed {:?}", conn.trace_id(), e);
+                    error!("{} stream send failed while sending with priority {:?}", conn.trace_id(), e);
                     return;
                 },
             }
         }
-
-        resp.headers = None;
-        resp.priority = None;
-
+        debug!("Priority for partial response on stream {} is {:?}",stream_id,resp.priority);
+        
         let body = &resp.body[resp.written..];
 
         let written = match self.h3_conn.send_body(conn, stream_id, body, true) {
@@ -1628,7 +1984,7 @@ impl HttpConn for Http3Conn {
             Err(e) => {
                 partial_responses.remove(&stream_id);
 
-                error!("{} stream send failed {:?}", conn.trace_id(), e);
+                error!("{} stream send failed while writing {:?}", conn.trace_id(), e);
                 return;
             },
         };

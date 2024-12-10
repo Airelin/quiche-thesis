@@ -31,6 +31,7 @@ pub trait Args {
 }
 
 /// Contains commons arguments for creating a quiche QUIC connection.
+#[derive(Clone)]  
 pub struct CommonArgs {
     pub alpns: Vec<&'static [u8]>,
     pub max_data: u64,
@@ -190,7 +191,7 @@ impl Args for CommonArgs {
             .get_str("--initial-cwnd-packets")
             .parse::<u64>()
             .unwrap();
-
+ 
         CommonArgs {
             alpns,
             max_data,
@@ -252,6 +253,7 @@ pub const CLIENT_USAGE: &str = "Usage:
   quiche-client -h | --help
 
 Options:
+  --store-eval PATH        Save evaluation timestamps on this path
   --method METHOD          Use the given HTTP request method [default: GET].
   --body FILE              Send the given file as request body.
   --max-data BYTES         Connection-wide flow control limit [default: 10000000].
@@ -309,6 +311,7 @@ pub struct ClientArgs {
     pub source_port: u16,
     pub perform_migration: bool,
     pub send_priority_update: bool,
+    pub store_eval: Option<String>,
 }
 
 impl Args for ClientArgs {
@@ -386,6 +389,12 @@ impl Args for ClientArgs {
 
         let send_priority_update = args.get_bool("--send-priority-update");
 
+        let store_eval = if args.get_str("--store-eval") != "" {
+            Some(args.get_str("--store-eval").to_string())
+        } else {
+            None
+        };
+
         ClientArgs {
             version,
             dump_response_path,
@@ -402,6 +411,7 @@ impl Args for ClientArgs {
             source_port,
             perform_migration,
             send_priority_update,
+            store_eval,
         }
     }
 }
@@ -424,6 +434,7 @@ impl Default for ClientArgs {
             source_port: 0,
             perform_migration: false,
             send_priority_update: false,
+            store_eval: None,
         }
     }
 }
@@ -433,11 +444,15 @@ pub const SERVER_USAGE: &str = "Usage:
   quiche-server -h | --help
 
 Options:
-  --listen <addr>             Listen on the given IP:port [default: 127.0.0.1:4433]
+  --listen-from <addr>        Listen on the given IP:port [default: 127.0.0.1:4433]
+  --listen-to <addr>          Listen on the given IP:port [default: 127.0.0.1:1234]
+  --store-rx PATH             Save intermediate results on this path
+  --store-tx PATH             Save intermediate results on this path
+  --store-eval PATH           Save evaluation timestamps on this path
+  --prio NAME                 Specify which prioritization algorithm to use [default: dynamic weighted]
+  --reliability               Enable reliable sending.
   --cert <file>               TLS certificate path [default: src/bin/cert.crt]
   --key <file>                TLS certificate key path [default: src/bin/cert.key]
-  --root <dir>                Root directory [default: src/bin/root/]
-  --index <name>              The file that will be used as index [default: index.html].
   --name <str>                Name of the server [default: quic.tech]
   --max-data BYTES            Connection-wide flow control limit [default: 10000000].
   --max-window BYTES          Connection-wide max receiver window [default: 25165824].
@@ -464,43 +479,279 @@ Options:
   --disable-gso               Disable GSO (linux only).
   --disable-pacing            Disable pacing (linux only).
   --initial-cwnd-packets PACKETS      The initial congestion window size in terms of packet count [default: 10].
+  --rate RATE                 Sets the non-dynamic sending rate in bits per second
   -h --help                   Show this screen.
 ";
 
 // Application-specific arguments that compliment the `CommonArgs`.
+#[derive(Clone)] 
 pub struct ServerArgs {
-    pub listen: String,
+    pub listen_from: String,
+    pub listen_to: String,
     pub no_retry: bool,
-    pub root: String,
-    pub index: String,
     pub cert: String,
     pub key: String,
     pub disable_gso: bool,
     pub disable_pacing: bool,
+    pub store_rx: Option<String>,
+    pub store_tx: Option<String>,
+    pub store_eval: Option<String>,
+    pub prio: String,
+    pub reliability: bool,
+    pub rate: Option<u64>,
 }
 
 impl Args for ServerArgs {
     fn with_docopt(docopt: &docopt::Docopt) -> Self {
         let args = docopt.parse().unwrap_or_else(|e| e.exit());
 
-        let listen = args.get_str("--listen").to_string();
+        let listen_from = args.get_str("--listen-from").to_string();
+        let listen_to = args.get_str("--listen-to").to_string();
         let no_retry = args.get_bool("--no-retry");
-        let root = args.get_str("--root").to_string();
-        let index = args.get_str("--index").to_string();
         let cert = args.get_str("--cert").to_string();
         let key = args.get_str("--key").to_string();
         let disable_gso = args.get_bool("--disable-gso");
         let disable_pacing = args.get_bool("--disable-pacing");
 
+        let store_rx = if args.get_str("--store-rx") != "" {
+            Some(args.get_str("--store-rx").to_string())
+        } else {
+            None
+        };
+        let store_tx = if args.get_str("--store-tx") != "" {
+            Some(args.get_str("--store-tx").to_string())
+        } else {
+            None
+        };
+        let store_eval = if args.get_str("--store-eval") != "" {
+            Some(args.get_str("--store-eval").to_string())
+        } else {
+            None
+        };
+        let prio = if args.get_str("--prio") != "" {
+            args.get_str("--prio").to_string()
+        } else {
+            "dynamic weighted".to_string()
+        };
+        let reliability = args.get_bool("--reliability");
+
+        let rate = if args.get_str("--rate") != "" {
+            Some(args.get_str("--rate").parse::<u64>().unwrap())
+        } else {
+            None
+        };
+
         ServerArgs {
-            listen,
+            listen_from,
+            listen_to,
             no_retry,
-            root,
-            index,
             cert,
             key,
             disable_gso,
             disable_pacing,
+            store_rx,
+            store_tx,
+            store_eval,
+            prio,
+            reliability,
+            rate
+        }
+    }
+}
+
+pub const DATACLIENT_USAGE: &str = "Usage:
+  quiche-data [options] URL...
+  quiche-data -h | --help
+
+Options:
+  --store-eval PATH        Save evaluation timestamps on this path
+  --method METHOD          Use the given HTTP request method [default: GET].
+  --body FILE              Send the given file as request body.
+  --max-data BYTES         Connection-wide flow control limit [default: 10000000].
+  --max-window BYTES       Connection-wide max receiver window [default: 25165824].
+  --max-stream-data BYTES  Per-stream flow control limit [default: 1000000].
+  --max-stream-window BYTES   Per-stream max receiver window [default: 16777216].
+  --max-streams-bidi STREAMS  Number of allowed concurrent streams [default: 100].
+  --max-streams-uni STREAMS   Number of allowed concurrent streams [default: 100].
+  --idle-timeout TIMEOUT   Idle timeout in milliseconds [default: 30000].
+  --wire-version VERSION   The version number to send to the server [default: babababa].
+  --http-version VERSION   HTTP version to use [default: all].
+  --early-data             Enable sending early data.
+  --dgram-proto PROTO      DATAGRAM application protocol to use [default: none].
+  --dgram-count COUNT      Number of DATAGRAMs to send [default: 0].
+  --dgram-data DATA        Data to send for certain types of DATAGRAM application protocol [default: quack].
+  --dump-packets PATH      Dump the incoming packets as files in the given directory.
+  --dump-responses PATH    Dump response payload as files in the given directory.
+  --dump-json              Dump response headers and payload to stdout in JSON format.
+  --max-json-payload BYTES  Per-response payload limit when dumping JSON [default: 10000].
+  --connect-to ADDRESS     Override the server's address.
+  --no-verify              Don't verify server's certificate.
+  --trust-origin-ca-pem <file>  Path to the pem file of the origin's CA, if not publicly trusted.
+  --no-grease              Don't send GREASE.
+  --cc-algorithm NAME      Specify which congestion control algorithm to use [default: cubic].
+  --disable-hystart        Disable HyStart++.
+  --max-active-cids NUM    The maximum number of active Connection IDs we can support [default: 2].
+  --enable-active-migration   Enable active connection migration.
+  --perform-migration      Perform connection migration on another source port.
+  -H --header HEADER ...   Add a request header.
+  -n --requests REQUESTS   Send the given number of identical requests [default: 1].
+  --send-priority-update   Send HTTP/3 priority updates if the query string params 'u' or 'i' are present in URLs
+  --max-field-section-size BYTES    Max size of uncompressed field section. Default is unlimited.
+  --qpack-max-table-capacity BYTES  Max capacity of dynamic QPACK decoding.. Any value other that 0 is currently unsupported.
+  --qpack-blocked-streams STREAMS   Limit of blocked streams while decoding. Any value other that 0 is currently unsupported.
+  --session-file PATH      File used to cache a TLS session for resumption.
+  --source-port PORT       Source port to use when connecting to the server [default: 0].
+  --initial-cwnd-packets PACKETS   The initial congestion window size in terms of packet count [default: 10].
+  -h --help                Show this screen.
+  --root <dir>             Root directory [default: ./]
+";
+
+/// Application-specific arguments that compliment the `CommonArgs`.
+#[derive(Clone)]  
+pub struct DataClientArgs {
+    pub version: u32,
+    pub dump_response_path: Option<String>,
+    pub dump_json: Option<usize>,
+    pub urls: Vec<url::Url>,
+    pub reqs_cardinal: u64,
+    pub req_headers: Vec<String>,
+    pub no_verify: bool,
+    pub trust_origin_ca_pem: Option<String>,
+    pub body: Option<Vec<u8>>,
+    pub method: String,
+    pub connect_to: Option<String>,
+    pub session_file: Option<String>,
+    pub source_port: u16,
+    pub perform_migration: bool,
+    pub send_priority_update: bool,
+    pub root: String,
+    pub store_eval: Option<String>,
+}
+
+impl Args for DataClientArgs {
+    fn with_docopt(docopt: &docopt::Docopt) -> Self {
+        let args = docopt.parse().unwrap_or_else(|e| e.exit());
+
+        let version = args.get_str("--wire-version");
+        let version = u32::from_str_radix(version, 16).unwrap();
+
+        let dump_response_path = if args.get_str("--dump-responses") != "" {
+            Some(args.get_str("--dump-responses").to_string())
+        } else {
+            None
+        };
+
+        let dump_json = args.get_bool("--dump-json");
+        let dump_json = if dump_json {
+            let max_payload = args.get_str("--max-json-payload");
+            let max_payload = max_payload.parse::<usize>().unwrap();
+            Some(max_payload)
+        } else {
+            None
+        };
+
+        // URLs (can be multiple).
+        let urls: Vec<url::Url> = args
+            .get_vec("URL")
+            .into_iter()
+            .map(|x| url::Url::parse(x).unwrap())
+            .collect();
+
+        // Request headers (can be multiple).
+        let req_headers = args
+            .get_vec("--header")
+            .into_iter()
+            .map(|x| x.to_string())
+            .collect();
+
+        let reqs_cardinal = args.get_str("--requests");
+        let reqs_cardinal = reqs_cardinal.parse::<u64>().unwrap();
+
+        let no_verify = args.get_bool("--no-verify");
+
+        let trust_origin_ca_pem = args.get_str("--trust-origin-ca-pem");
+        let trust_origin_ca_pem = if !trust_origin_ca_pem.is_empty() {
+            Some(trust_origin_ca_pem.to_string())
+        } else {
+            None
+        };
+
+        let body = if args.get_bool("--body") {
+            std::fs::read(args.get_str("--body")).ok()
+        } else {
+            None
+        };
+
+        let method = args.get_str("--method").to_string();
+
+        let connect_to = if args.get_bool("--connect-to") {
+            Some(args.get_str("--connect-to").to_string())
+        } else {
+            None
+        };
+
+        let session_file = if args.get_bool("--session-file") {
+            Some(args.get_str("--session-file").to_string())
+        } else {
+            None
+        };
+
+        let source_port = args.get_str("--source-port");
+        let source_port = source_port.parse::<u16>().unwrap();
+
+        let perform_migration = args.get_bool("--perform-migration");
+
+        let send_priority_update = args.get_bool("--send-priority-update");
+        let root = args.get_str("--root").to_string();
+
+        let store_eval = if args.get_str("--store-eval") != "" {
+            Some(args.get_str("--store-eval").to_string())
+        } else {
+            None
+        };
+
+        DataClientArgs {
+            version,
+            dump_response_path,
+            dump_json,
+            urls,
+            reqs_cardinal,
+            req_headers,
+            no_verify,
+            trust_origin_ca_pem,
+            body,
+            method,
+            connect_to,
+            session_file,
+            source_port,
+            perform_migration,
+            send_priority_update,
+            root,
+            store_eval
+        }
+    }
+}
+
+impl Default for DataClientArgs {
+    fn default() -> Self {
+        DataClientArgs {
+            version: 0xbabababa,
+            dump_response_path: None,
+            dump_json: None,
+            urls: vec![],
+            req_headers: vec![],
+            reqs_cardinal: 1,
+            no_verify: false,
+            trust_origin_ca_pem: None,
+            body: None,
+            method: "POST".to_string(),
+            connect_to: None,
+            session_file: None,
+            source_port: 0,
+            perform_migration: false,
+            send_priority_update: false,
+            root: "./../send_files/".to_string(),
+            store_eval: None,
         }
     }
 }

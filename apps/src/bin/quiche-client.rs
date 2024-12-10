@@ -24,6 +24,13 @@
 // NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
 // SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+#[macro_use]
+extern crate log;
+
+use std::fs;
+use std::io::BufWriter;
+use std::io::Write;
+
 use quiche_apps::args::*;
 
 use quiche_apps::common::*;
@@ -36,7 +43,30 @@ fn main() {
     // Parse CLI parameters.
     let docopt = docopt::Docopt::new(CLIENT_USAGE).unwrap();
     let conn_args = CommonArgs::with_docopt(&docopt);
-    let args = ClientArgs::with_docopt(&docopt);
+    let mut args = ClientArgs::with_docopt(&docopt);
+
+    // create a log-file
+    match args.store_eval{
+        Some(ref p) => {
+            // Make BufWriter
+            let path = format!("{}/client.txt",p);
+            let file = fs::OpenOptions::new().create(true).append(true).open(&path);
+            match file{
+                Ok(v) => {
+                    let mut rw = BufWriter::new(v);
+                    let text = format!("timestamp;packet-type;stream-id;body-bytes\n");
+                    rw.write_all(text.as_bytes()).ok();
+                    rw.flush().unwrap();
+                },
+                Err(_) => (),
+            }
+        },
+        None => (),
+    };
+
+    // Add user-agent to the headers
+    // quiche::h3::Header::new(b"user-agent", b"quiche"),
+    args.req_headers.push(("user-agent: quiche-client").to_string());
 
     match connect(args, conn_args, stdout_sink) {
         Err(ClientError::HandshakeFail) => std::process::exit(-1),
@@ -45,6 +75,6 @@ fn main() {
 
         Err(ClientError::Other(e)) => panic!("{}", e),
 
-        Ok(_) => (),
+        Ok(_) => info!("Correctly Done!"),
     }
 }

@@ -247,6 +247,8 @@ pub fn connect(
     let mut new_path_probed = false;
     let mut migrated = false;
 
+    let mut looped = 0;
+
     loop {
         if !conn.is_in_early_data() || app_proto_selected {
             poll.poll(&mut events, conn.timeout()).unwrap();
@@ -414,8 +416,20 @@ pub fn connect(
         // If we have an HTTP connection, first issue the requests then
         // process received data.
         if let Some(h_conn) = http_conn.as_mut() {
-            h_conn.send_requests(&mut conn, &args.dump_response_path);
+            // We are a client so we need to act like a client
+            if looped == 0 {
+                h_conn.send_requests(&mut conn, &args.dump_response_path);
+                looped = looped + 1;
+            }
             h_conn.handle_responses(&mut conn, &mut buf, &app_data_start);
+
+            // TODO: Handle incoming POST requests
+            
+            // let mut partial_responses = HashMap::new();
+            // let mut partial_requests= HashMap::new();
+            // if h_conn.handle_requests(&mut conn, &mut partial_requests, &mut partial_responses, "", "", &mut buf).is_err(){
+            //     continue;
+            // }
         }
 
         // Handle path events.

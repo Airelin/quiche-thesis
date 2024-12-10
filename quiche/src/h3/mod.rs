@@ -706,7 +706,7 @@ pub enum Event {
 /// Structured Fields Dictionary field value. I.e, use `TryFrom` to parse the
 /// value of a Priority header field or a PRIORITY_UPDATE frame. Using this
 /// trait requires the `sfv` feature to be enabled.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 #[repr(C)]
 pub struct Priority {
     urgency: u8,
@@ -729,6 +729,13 @@ impl Priority {
             urgency,
             incremental,
         }
+    }
+}
+
+impl Priority {
+    /// Get the priority values as a tuple
+    pub fn get_tuple(&self) -> (u8,bool){
+        (self.urgency,self.incremental)
     }
 }
 
@@ -993,6 +1000,7 @@ impl Connection {
             self.streams.remove(&stream_id);
 
             if e == super::Error::Done {
+                info!("StreamBlocked!");
                 return Err(Error::StreamBlocked);
             }
 
@@ -1232,6 +1240,7 @@ impl Connection {
         // Make sure there is enough capacity to send the DATA frame header.
         if stream_cap < overhead {
             let _ = conn.stream_writable(stream_id, overhead + 1);
+            info!("Overhead {} is bigger than capacity {}, {}", overhead, stream_cap, conn.trace_id());
             return Err(Error::Done);
         }
 
@@ -1257,10 +1266,11 @@ impl Connection {
         // Sending body separately avoids unnecessary copy.
         let written = conn.stream_send(stream_id, &body[..body_len], fin)?;
 
-        trace!(
-            "{} tx frm DATA stream={} len={} fin={}",
+        debug!(
+            "{} tx frm DATA stream={} body_len={} len={} fin={}",
             conn.trace_id(),
             stream_id,
+            body_len,
             written,
             fin
         );
